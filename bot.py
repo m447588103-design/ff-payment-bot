@@ -54,6 +54,7 @@ def init_db():
             "rocket_number": os.getenv("ROCKET_NUMBER", ""),
             "review_channel_id": os.getenv("REVIEW_CHANNEL_ID", ""),
             "admin_role_id": os.getenv("ADMIN_ROLE_ID", ""),
+            "notification_user_id": os.getenv("NOTIFICATION_USER_ID", "").strip(),
             "payment_title": os.getenv("PAYMENT_TITLE", "FF Esports Registration"),
         }
         for key, value in defaults.items():
@@ -84,6 +85,33 @@ def money():
 
 def payment_number(method):
     return setting({"bKash":"bkash_number", "Nagad":"nagad_number", "Rocket":"rocket_number"}[method], "").strip()
+
+async def notify_admin_of_submission(channel, embed):
+    recipient_id = setting("notification_user_id", "").strip() or os.getenv("NOTIFICATION_USER_ID", "").strip()
+    try:
+        recipient_id = int(recipient_id)
+    except ValueError:
+        log.warning("Payment DM notification recipient is not configured with a valid Discord user ID")
+        return
+    if recipient_id <= 0:
+        log.warning("Payment DM notification recipient must be a positive Discord user ID")
+        return
+
+    recipient = bot.get_user(recipient_id)
+    if recipient is None:
+        try:
+            recipient = await bot.fetch_user(recipient_id)
+        except discord.HTTPException as exc:
+            log.warning("Could not find payment DM notification recipient %s: %s", recipient_id, exc)
+            return
+
+    try:
+        await recipient.send(
+            content=f"📥 A new payment submission is waiting for review in {channel.mention}.",
+            embed=embed,
+        )
+    except discord.HTTPException as exc:
+        log.warning("Could not DM payment notification to user %s: %s", recipient_id, exc)
 
 class PaymentSubmitModal(discord.ui.Modal, title="Submit Payment Details"):
     registration_ref = discord.ui.TextInput(label="Registration / Player ID", placeholder="e.g. FF-2026-0042", max_length=80)
@@ -153,6 +181,7 @@ class PaymentSubmitModal(discord.ui.Modal, title="Submit Payment Details"):
         await interaction.response.send_message(
             f"✅ Payment details submitted for manual verification.\nRecord: `PAY-{payment_id:06d}`\nStatus: **PENDING**\nAn admin will review it.", ephemeral=True
         )
+        await notify_admin_of_submission(channel, embed)
 
 class RejectReasonModal(discord.ui.Modal, title="Reject Payment"):
     reason = discord.ui.TextInput(label="Reason for rejection", placeholder="e.g. Payment not found / wrong amount", max_length=300)
@@ -314,12 +343,13 @@ async def payment_panel(interaction: discord.Interaction):
 
 admin = app_commands.Group(name="payadmin", description="Payment bot administration")
 
-@admin.command(name="setup", description="Configure fee, payment numbers, review channel and optional admin role")
+@admin.command(name="setup", description="Configure payments, review channel, admin role and DM notification recipient")
 @app_commands.describe(fee="Registration fee in BDT", bkash="bKash number", nagad="Nagad number", rocket="Rocket number",
-                       review_channel="Private channel where payment requests are sent", admin_role="Optional role allowed to review payments")
+                       review_channel="Private channel where payment requests are sent", admin_role="Optional role allowed to review payments",
+                       notification_user="Member who receives a DM for every submission (defaults to you)")
 async def setup(interaction: discord.Interaction, fee: app_commands.Range[int, 1, 100000],
                 bkash: str, nagad: str, rocket: str, review_channel: discord.TextChannel,
-                admin_role: discord.Role = None):
+                admin_role: discord.Role = None, notification_user: discord.Member = None):
     if interaction.guild is None or not (interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild):
         return await interaction.response.send_message("⛔ Server Administrator / Manage Server permission required for setup.", ephemeral=True)
     set_setting("fee", fee)
@@ -328,8 +358,10 @@ async def setup(interaction: discord.Interaction, fee: app_commands.Range[int, 1
     set_setting("rocket_number", rocket.strip())
     set_setting("review_channel_id", review_channel.id)
     set_setting("admin_role_id", admin_role.id if admin_role else "")
+    notification_user = notification_user or interaction.user
+    set_setting("notification_user_id", notification_user.id)
     await interaction.response.send_message(
-        f"✅ Payment bot configured.\nFee: ৳{fee}\nReview channel: {review_channel.mention}\nAdmin role: {admin_role.mention if admin_role else 'Server admins only'}",
+        f"✅ Payment bot configured.\nFee: ৳{fee}\nReview channel: {review_channel.mention}\nAdmin role: {admin_role.mention if admin_role else 'Server admins only'}\nDM notifications: {notification_user.mention} (make sure this member allows server DMs)",
         ephemeral=True
     )
 
