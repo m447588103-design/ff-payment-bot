@@ -1,0 +1,13 @@
+# Keep local state and secrets out of the image
+.git
+.gitignore
+.env
+.env.local
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+tests
+data
+*.sqlite3
