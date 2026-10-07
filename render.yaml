@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: ff-payment-verification-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: false
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: DATABASE_PATH
+        value: data/payments.sqlite3
