@@ -1,0 +1,15 @@
+# Secrets and local state
+.env
+.env.local
+
+# Local databases
+data/
+*.sqlite3
+*.sqlite3-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
