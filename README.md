@@ -12,6 +12,8 @@ Standalone Discord payment-verification bot for an existing tournament/sports bo
 - After a decision both the channel message and the DM lose their buttons and show the result, so a second admin cannot flip it
 - If the DM cannot be delivered (DMs disabled), the submission still arrives in the review channel and the bot says so
 - DMs the player the review result
+- `/paystatus` lets a player privately check **their own** latest payment or a specific `PAY-000000` record (another player's record is reported as not found)
+- DMs the configured admin again while a payment is still **PENDING** — first reminder after 30 minutes, then about every 30 minutes until it is reviewed
 - Unique Transaction ID constraint blocks duplicate submissions
 - SQLite persistence, stats and payment lookup slash commands
 - Server admin / Manage Server checks and optional payment-admin role
@@ -28,6 +30,16 @@ The Approve / Reject buttons are a **shortcut for a human decision**, nothing mo
 Every review embed repeats this reminder, and the bot never sends a player a message claiming automatic verification.
 
 Approving this standalone bot does not automatically update your existing sports bot unless you later integrate a shared database or API.
+
+## Pending payment reminders
+The admin who receives the review DM is reminded until the submission is reviewed:
+- the first reminder arrives once a payment has been pending for **30 minutes**;
+- further reminders repeat about every **30 minutes** while it stays PENDING;
+- reviewing the payment (Approve/Reject) stops the reminders immediately.
+
+Reminder DMs are informational: they repeat the record number, player, amount, method, Transaction ID and how long it has been waiting, and they link back to the review message so the Approve/Reject buttons stay in one place. The bot checks for due reminders every 5 minutes, and each payment is stamped with its last reminder time so the same payment is never reminded twice inside 30 minutes — that also holds across a restart, because the stamp is stored in SQLite.
+
+If the recipient's DMs are closed, the bot records the attempt (so it will not retry on every sweep), posts one warning in the review channel and keeps the submission reviewable from the channel. With no recipient configured, reminders are skipped and the submission stays reviewable in the channel, exactly like submission DMs.
 
 ## Who can approve
 - **In the review channel:** server administrators, members with Manage Server, or members holding the configured payment-admin role.
@@ -58,8 +70,9 @@ Restarting the bot is safe: pending submissions keep working, because the Approv
 ## Slash commands
 - `/payadmin setup` — configure fee, numbers, review channel, optional admin role and DM notification recipient (defaults to the admin running setup)
 - `/payment_panel` — post the player payment panel
+- `/paystatus [record:<PAY-000012 or TrxID>]` — **player command**, no admin rights needed: privately shows your own latest payment (no value) or one specific record you submitted. Every reply is ephemeral and every query is filtered to your own user ID, so nobody can read another player's submission with it; admins keep using `/payadmin lookup`
 - `/payadmin stats` — show total/pending/approved/rejected counts
-- `/payadmin lookup query:<TrxID or PAY-000001>` — look up a submission
+- `/payadmin lookup query:<TrxID or PAY-000001>` — look up any submission (admin only)
 
 ## Configuration
 Everything can be set with `/payadmin setup`; environment variables are the defaults for a fresh database. See `.env.example`.
@@ -75,12 +88,13 @@ Everything can be set with `/payadmin setup`; environment variables are the defa
 Never upload `.env` or your token to GitHub.
 
 ## Tests
-The repository ships offline checks that need no token and no Discord connection: schema/migration, button custom IDs, permission rules, embed wording and a full simulated flow (submit → review-channel post → reviewer DM with buttons → approve/reject → player notification).
+The repository ships offline checks that need no token and no Discord connection: schema/migration, button custom IDs, permission rules, embed wording, a full simulated flow (submit → review-channel post → reviewer DM with buttons → approve/reject → player notification), `/paystatus` privacy and the pending-reminder cadence (first reminder at 30 minutes, repeat gated to one per 30 minutes, stopped by a review, blocked-DM handling).
 
 ```powershell
 pip install pytest
-python tests/test_review_flow.py        # no test runner required
+python tests/test_review_flow.py                    # no test runner required
 python tests/test_end_to_end_flow.py
+python tests/test_payment_status_and_reminders.py
 python -m pytest tests -q
 ```
 

@@ -13,11 +13,11 @@ import os
 import re
 import sqlite3
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,6 +38,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 REVIEW_CUSTOM_ID_RE = re.compile(r"^pay:review:(approve|reject):(\d+)$")
 REVIEW_CUSTOM_ID = "pay:review:{action}:{payment_id}"
 LEGACY_CUSTOM_IDS = {"pay:approve": "approve", "pay:reject": "reject"}
+
+# Pending-payment reminders. The sweep only *looks* for due reminders every few
+# minutes; the cadence each admin actually sees is controlled by the two values
+# below: the first DM goes out once a payment has been pending for 30 minutes,
+# and further DMs repeat at most once every 30 minutes until it is reviewed.
+PENDING_REMINDER_MINUTES = 30
+PENDING_REMINDER_INTERVAL_MINUTES = 30
+PENDING_REMINDER_SWEEP_MINUTES = 5
 
 MANUAL_CHECK_NOTE = (
     "Open your bKash / Nagad / Rocket app or statement and confirm the money actually "
@@ -81,7 +89,9 @@ def init_db():
             review_channel_id INTEGER,
             channel_message_id INTEGER,
             dm_message_id INTEGER,
-            dm_recipient_id INTEGER
+            dm_recipient_id INTEGER,
+            reminder_count INTEGER NOT NULL DEFAULT 0,
+            last_reminded_at TEXT
         )""")
 
         # Additive migration for databases created before the DM review columns existed.
@@ -90,6 +100,8 @@ def init_db():
             ("channel_message_id", "INTEGER"),
             ("dm_message_id", "INTEGER"),
             ("dm_recipient_id", "INTEGER"),
+            ("reminder_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_reminded_at", "TEXT"),
         ):
             if column not in _table_columns(conn, "payments"):
                 conn.execute(f"ALTER TABLE payments ADD COLUMN {column} {ddl_type}")
@@ -149,6 +161,118 @@ def payment_number(method):
 
 def payment_label(payment_id):
     return f"PAY-{int(payment_id):06d}"
+
+
+def parse_timestamp(value):
+    """Read one of our stored ISO timestamps back as an aware UTC datetime.
+
+    Rows are written with datetime.now(timezone.utc).isoformat(); anything that
+    cannot be parsed returns None so a hand-edited row never breaks a sweep.
+    """
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def human_time(value):
+    stamp = parse_timestamp(value)
+    if stamp is None:
+        return str(value) if value else "—"
+    return stamp.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def find_player_payment(query, user_id):
+    """Look up *one player's own* payment row: their latest, or a specific record.
+
+    The user_id filter is part of every query on purpose — /paystatus must never
+    be able to read somebody else's submission, so a record that exists but
+    belongs to another player simply comes back as no match.
+    """
+    query = (query or "").strip()
+    with db() as conn:
+        if not query:
+            return conn.execute(
+                "SELECT * FROM payments WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)
+            ).fetchone()
+        match = re.fullmatch(r"PAY-?(\d+)", query, flags=re.IGNORECASE)
+        if match:
+            return conn.execute(
+                "SELECT * FROM payments WHERE id=? AND user_id=?", (int(match.group(1)), user_id)
+            ).fetchone()
+        row = conn.execute(
+            "SELECT * FROM payments WHERE transaction_id=? AND user_id=?", (query.upper(), user_id)
+        ).fetchone()
+        if row is None and query.isdigit():
+            # Convenience only: a bare number is the record id when no Transaction
+            # ID matches, which is how players usually read "Record: PAY-000012".
+            row = conn.execute(
+                "SELECT * FROM payments WHERE id=? AND user_id=?", (int(query), user_id)
+            ).fetchone()
+        return row
+
+
+def player_status_embed(row):
+    """Private status card for the player who owns the record."""
+    status = row["status"]
+    if status == "APPROVED":
+        color, label = discord.Color.green(), "✅ APPROVED"
+    elif status == "REJECTED":
+        color, label = discord.Color.red(), "❌ REJECTED"
+    else:
+        color, label = discord.Color.orange(), "⏳ PENDING — manual verification"
+
+    embed = discord.Embed(
+        title=f"Payment {payment_label(row['id'])}",
+        color=color,
+        description=f"Status: **{label}**",
+    )
+    embed.add_field(name="Registration ID", value=row["registration_ref"], inline=True)
+    embed.add_field(name="Tournament", value=row["tournament"], inline=True)
+    embed.add_field(name="Amount", value=f"৳{row['amount']}", inline=True)
+    embed.add_field(name="Method", value=row["method"], inline=True)
+    embed.add_field(name="Transaction ID", value=f"`{row['transaction_id']}`", inline=True)
+    embed.add_field(name="Submitted at", value=human_time(row["submitted_at"]), inline=True)
+
+    if status == "PENDING":
+        embed.add_field(
+            name="What happens next",
+            value=(
+                "An admin still has to confirm your transfer in the bKash / Nagad / Rocket "
+                "statement. This bot cannot verify a personal-wallet transfer automatically. "
+                f"Admins are reminded about it about every {PENDING_REMINDER_INTERVAL_MINUTES} minutes "
+                "until it is reviewed."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Reviewed at", value=human_time(row["reviewed_at"]), inline=True)
+        if row["reviewed_by"]:
+            embed.add_field(name="Reviewed by", value=f"<@{row['reviewed_by']}>", inline=True)
+        if status == "REJECTED":
+            embed.add_field(
+                name="Reason",
+                value=row["review_reason"] or "No reason was recorded. Please contact a tournament admin.",
+                inline=False,
+            )
+            embed.add_field(
+                name="Next step",
+                value="Contact a tournament admin if you believe this is a mistake.",
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Result",
+                value="Your payment was checked manually and approved.",
+                inline=False,
+            )
+    embed.set_footer(text="Only you can see this message — you can only check your own payments.")
+    return embed
 
 
 def configured_reviewer_id():
@@ -318,6 +442,178 @@ async def _warn_review_channel(channel, text):
         await channel.send(text)
     except discord.HTTPException as exc:
         log.warning("Could not post review-channel warning: %s", exc)
+
+
+def review_channel():
+    """The configured review channel, or None when it is unset/unavailable."""
+    channel_id = int(setting("review_channel_id", "0") or 0)
+    return bot.get_channel(channel_id) if channel_id else None
+
+
+def review_message_link(row):
+    """Deep link to the review-channel copy of a submission (empty when unknown)."""
+    channel_id = row["review_channel_id"] or int(setting("review_channel_id", "0") or 0)
+    if not channel_id or not row["channel_message_id"] or not GUILD_ID:
+        return ""
+    return f"https://discord.com/channels/{GUILD_ID}/{int(channel_id)}/{int(row['channel_message_id'])}"
+
+
+def pending_minutes(row, now=None):
+    submitted = parse_timestamp(row["submitted_at"])
+    if submitted is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0, int((now - submitted).total_seconds() // 60))
+
+
+def pending_reminders_due(now=None):
+    """Pending payments whose admin reminder is due.
+
+    Due means: still PENDING, submitted at least PENDING_REMINDER_MINUTES ago and
+    not reminded within the last PENDING_REMINDER_INTERVAL_MINUTES (never reminded
+    counts as due). Timestamps are compared as datetimes, not strings.
+    """
+    now = now or datetime.now(timezone.utc)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM payments WHERE status='PENDING' ORDER BY id").fetchall()
+
+    due = []
+    for row in rows:
+        submitted = parse_timestamp(row["submitted_at"])
+        if submitted is None or now - submitted < timedelta(minutes=PENDING_REMINDER_MINUTES):
+            continue
+        last = parse_timestamp(row["last_reminded_at"])
+        if last is not None and now - last < timedelta(minutes=PENDING_REMINDER_INTERVAL_MINUTES):
+            continue
+        due.append(row)
+    return due
+
+
+def record_reminder_attempt(payment_id, delivered, now=None):
+    """Remember when we reminded (or tried to).
+
+    last_reminded_at is written on every attempt so a reviewer with DMs closed is
+    not retried on every sweep; reminder_count only counts delivered DMs.
+    """
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    with db() as conn:
+        if delivered:
+            conn.execute(
+                "UPDATE payments SET reminder_count=reminder_count+1, last_reminded_at=? "
+                "WHERE id=? AND status='PENDING'",
+                (stamp, payment_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE payments SET last_reminded_at=? WHERE id=? AND status='PENDING'",
+                (stamp, payment_id),
+            )
+
+
+def build_reminder_embed(row, now=None):
+    """Reminder DM body — same manual-check rules as the original submission DM."""
+    now = now or datetime.now(timezone.utc)
+    waited = pending_minutes(row, now)
+    waited_text = f"about {waited} minutes" if waited is not None else "a while"
+    embed = discord.Embed(
+        title="⏰ Payment still pending",
+        color=discord.Color.orange(),
+        description=(
+            f"`{payment_label(row['id'])}` has been waiting for manual review for {waited_text}.\n"
+            f"This reminder repeats about every {PENDING_REMINDER_INTERVAL_MINUTES} minutes until it is reviewed."
+        ),
+    )
+    embed.add_field(name="Player", value=f"<@{row['user_id']}>\n`{row['user_id']}`", inline=True)
+    embed.add_field(name="Amount", value=f"৳{row['amount']}", inline=True)
+    embed.add_field(name="Method", value=row["method"], inline=True)
+    embed.add_field(name="Registration / Player ID", value=row["registration_ref"], inline=True)
+    embed.add_field(name="Tournament", value=row["tournament"], inline=True)
+    embed.add_field(name="Transaction ID", value=f"`{row['transaction_id']}`", inline=False)
+    embed.add_field(name="Submitted at", value=human_time(row["submitted_at"]), inline=True)
+    embed.add_field(name="Reminders sent", value=str(int(row["reminder_count"] or 0)), inline=True)
+
+    link = review_message_link(row)
+    if link:
+        pointer = f"[Open the review message]({link})"
+    else:
+        channel_id = row["review_channel_id"] or int(setting("review_channel_id", "0") or 0)
+        pointer = f"Open the review channel (<#{channel_id}>)" if channel_id else "Open the review channel"
+    embed.add_field(
+        name="Next step",
+        value=f"{pointer} and confirm the transfer in your wallet statement, then Approve or Reject.",
+        inline=False,
+    )
+    embed.add_field(name="⚠️ Manual check required", value=MANUAL_CHECK_NOTE, inline=False)
+    embed.set_footer(text="Reminder only — this bot cannot verify personal-wallet transfers automatically.")
+    return embed
+
+
+async def send_pending_reminders(now=None):
+    """DM the configured reviewer about every pending payment that is due.
+
+    Returns the number of reminders delivered. Called by the background sweep and
+    directly by the offline tests.
+    """
+    now = now or datetime.now(timezone.utc)
+    due = pending_reminders_due(now)
+    if not due:
+        return 0
+
+    reviewer_id = configured_reviewer_id()
+    if not reviewer_id:
+        log.warning("Pending reminders skipped: no review-DM recipient configured")
+        return 0
+
+    reviewer = await resolve_user(reviewer_id)
+    if reviewer is None:
+        log.warning("Pending reminders skipped: could not resolve review-DM recipient %s", reviewer_id)
+        return 0
+
+    channel = review_channel()
+    delivered = 0
+    for row in due:
+        # The payment may have been reviewed between the sweep query and this DM.
+        with db() as conn:
+            fresh = conn.execute("SELECT status FROM payments WHERE id=?", (row["id"],)).fetchone()
+        if not fresh or fresh["status"] != "PENDING":
+            continue
+
+        try:
+            await reviewer.send(
+                content=(
+                    f"⏰ `{payment_label(row['id'])}` is still **PENDING** manual review. "
+                    "Check your wallet statement before approving or rejecting."
+                ),
+                embed=build_reminder_embed(row, now),
+            )
+        except discord.HTTPException as exc:
+            log.warning("Could not DM pending reminder for %s: %s", payment_label(row["id"]), exc)
+            was_first = not int(row["reminder_count"] or 0)
+            record_reminder_attempt(row["id"], delivered=False, now=now)
+            if was_first:
+                await _warn_review_channel(
+                    channel,
+                    f"⚠️ Could not DM <@{reviewer_id}> a pending reminder for "
+                    f"{payment_label(row['id'])} ({type(exc).__name__}: the member may have DMs "
+                    "disabled). Please review it here.",
+                )
+            continue
+
+        record_reminder_attempt(row["id"], delivered=True, now=now)
+        delivered += 1
+
+    if delivered:
+        log.info("Sent %d pending-payment reminder(s)", delivered)
+    return delivered
+
+
+@tasks.loop(minutes=PENDING_REMINDER_SWEEP_MINUTES)
+async def pending_reminder_task():
+    """Sweep for payments that are overdue for their admin reminder."""
+    try:
+        await send_pending_reminders()
+    except Exception:  # a broken sweep must never kill the loop
+        log.exception("Pending reminder sweep failed")
 
 
 class RejectReasonModal(discord.ui.Modal, title="Reject Payment"):
@@ -631,6 +927,9 @@ async def on_ready():
         for row in rows:
             bot.add_view(ReviewView(row["id"]))
         bot._persistent_views_added = True
+    if not getattr(bot, "_reminder_sweep_started", False):
+        pending_reminder_task.start()
+        bot._reminder_sweep_started = True
     try:
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -652,6 +951,32 @@ async def payment_panel(interaction: discord.Interaction):
     embed.add_field(name="Supported methods", value="bKash • Nagad • Rocket", inline=False)
     await interaction.channel.send(embed=embed, view=PaymentPanelView())
     await interaction.response.send_message("✅ Payment panel posted.", ephemeral=True)
+
+
+@bot.tree.command(name="paystatus", description="Privately check your own payment status")
+@app_commands.describe(record="Optional: PAY-000012 or your Transaction ID. Leave empty for your latest payment.")
+async def paystatus(interaction: discord.Interaction, record: str = None):
+    """Player-facing status check.
+
+    Every reply is ephemeral and every query is filtered by the caller's user id,
+    so a player can only ever see their own submissions — anyone else's record is
+    reported as "not found", which also avoids confirming that it exists.
+    """
+    row = find_player_payment(record, interaction.user.id)
+    if row is None:
+        if (record or "").strip():
+            return await interaction.response.send_message(
+                f"No payment record found for you matching `{record.strip()}`.\n"
+                "You can only check your own payments. Use `/paystatus` with no value for your "
+                "latest submission, or ask an admin if you think something is wrong.",
+                ephemeral=True,
+            )
+        return await interaction.response.send_message(
+            "You have not submitted a payment yet. Use the payment panel to send your "
+            "Transaction ID after paying the registration fee.",
+            ephemeral=True,
+        )
+    await interaction.response.send_message(embed=player_status_embed(row), ephemeral=True)
 
 
 admin = app_commands.Group(name="payadmin", description="Payment bot administration")
