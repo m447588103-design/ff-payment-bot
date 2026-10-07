@@ -6,7 +6,7 @@ Standalone Discord payment-verification bot for an existing tournament/sports bo
 - Player payment panel with bKash, Nagad and Rocket selection
 - Shows configured registration fee and payment number
 - Modal collects registration/player ID, tournament name, sender number and Transaction ID
-- Sends each submission to a private admin review channel
+- Sends each submission to a private admin review channel and DMs the configured notification recipient
 - Admin Approve / Reject-with-reason buttons
 - DMs player with review result
 - Unique Transaction ID constraint blocks duplicate submissions
@@ -31,11 +31,11 @@ This is **manual verification**. The bot does not independently verify a bKash/N
    ```
 
 6. In your Discord server, create a private channel such as `#payment-verification`. Give the bot View Channel, Send Messages, Embed Links and Read Message History permissions.
-7. Run `/payadmin setup` as a server administrator. Set fee, all payment numbers, review channel, and optionally an admin role.
+7. Run `/payadmin setup` as a server administrator. Set fee, all payment numbers, review channel, and optionally an admin role. By default, the admin who runs setup receives a DM for every new payment submission; use the optional `notification_user` choice to send those DMs to another server member. Alternatively, set `NOTIFICATION_USER_ID` to that member's Discord user ID. The recipient must allow DMs from server members; if a DM is blocked, the submission still appears in the review channel.
 8. Run `/payment_panel` in the channel where players should submit payments.
 
 ## Slash commands
-- `/payadmin setup` — configure fee, numbers, review channel, optional admin role
+- `/payadmin setup` — configure fee, numbers, review channel, optional admin role and DM notification recipient (defaults to the admin running setup)
 - `/payment_panel` — post the player payment panel
 - `/payadmin stats` — show total/pending/approved/rejected counts
 - `/payadmin lookup query:<TrxID or PAY-000001>` — look up a submission
