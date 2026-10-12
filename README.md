@@ -3,7 +3,9 @@
 Standalone Discord payment-verification bot for an existing tournament/sports bot. It does **not** create tournaments or change your existing sports bot.
 
 ## Features
-- Player payment panel with bKash, Nagad and Rocket selection
+- Neon esports checkout panel: a branded embed (fee, configured wallets, 3-step instructions, safety notes) topped with the banner in `assets/payment_banner.png`
+- The banner is optional — it is uploaded when the bot may attach files and skipped automatically when it cannot, so the panel always posts (see "Payment panel banner")
+- Player payment panel with bKash, Nagad and Rocket selection; each wallet gets its own branded "Pay via" card with the number, amount and steps
 - Shows configured registration fee and payment number
 - Modal collects registration/player ID, tournament name, sender number and Transaction ID
 - Posts each submission to the private admin review channel **and DMs the configured admin**
@@ -46,10 +48,20 @@ If the recipient's DMs are closed, the bot records the attempt (so it will not r
 - **In the DM:** the configured review recipient, plus any server admin the bot can still resolve through `GUILD_ID`.
 - A DM carries no permissions of its own, so a member who is not in the list above is refused with "You are not authorized to review payments."
 
+## Payment panel banner
+`/payment_panel` posts the checkout embed with the neon banner from `assets/payment_banner.png` (1280×423 PNG, ~650 KB) attached and shown as the embed image. The upload is **optional**:
+- If the bot lacks **Attach Files** in that channel, or the file is missing/unreadable, or Discord refuses the upload, the bot posts the very same panel without the image and tells the admin why in the ephemeral reply. Players never see an error.
+- `/payment_panel banner:False` posts without the image on purpose.
+- `PAYMENT_BANNER_PATH` points at a different file (relative paths are resolved from the bot folder); leave it empty to disable the banner.
+- `PAYMENT_BANNER_URL` embeds an already-hosted image instead of uploading anything, so no Attach Files permission is needed.
+- The panel title comes from `PAYMENT_TITLE` (stored as `payment_title` in settings).
+
+The panel's wallet menu is a persistent view with a fixed component ID, so panels keep working after a restart. Panels posted by builds before this one used a random ID and stop responding once the bot restarts — simply run `/payment_panel` again and delete the old message.
+
 ## Run locally (Windows / VS Code)
 1. Install Python 3.11+.
 2. Create a Discord application and bot at https://discord.com/developers/applications
-3. Enable the bot and invite it with `bot` + `applications.commands` scopes. Grant Send Messages, Embed Links, Use Application Commands, and View Channels. Do not give Administrator unless necessary.
+3. Enable the bot and invite it with `bot` + `applications.commands` scopes. Grant Send Messages, Embed Links, Use Application Commands, and View Channels; add Attach Files if you want the checkout banner on the payment panel (optional — without it the panel is posted image-free). Do not give Administrator unless necessary.
 4. Copy `.env.example` to `.env`; set `DISCORD_TOKEN` and `GUILD_ID`.
 5. Open a terminal in this folder and run:
 
@@ -63,13 +75,13 @@ If the recipient's DMs are closed, the bot records the attempt (so it will not r
 6. In your Discord server, create a private channel such as `#payment-verification`. Give the bot View Channel, Send Messages, Embed Links and Read Message History permissions.
 7. Run `/payadmin setup` as a server administrator. Set fee, all payment numbers, review channel, and optionally an admin role. By default, the admin who runs setup receives the Approve/Reject DM for every new payment submission; use the optional `notification_user` choice to send those DMs to another server member, or set `NOTIFICATION_USER_ID` to that member's Discord user ID.
    - The recipient must allow DMs from server members. If a DM is blocked, the submission still appears in the review channel and the bot posts a warning there.
-8. Run `/payment_panel` in the channel where players should submit payments.
+8. Run `/payment_panel` in the channel where players should submit payments. Give the bot Attach Files there if you want the banner; otherwise the panel is posted without it.
 
-Restarting the bot is safe: pending submissions keep working, because the Approve/Reject buttons are persistent and carry their own payment ID.
+Restarting the bot is safe: pending submissions keep working, because the Approve/Reject buttons are persistent and carry their own payment ID, and the payment panel's wallet menu is re-registered on start-up.
 
 ## Slash commands
 - `/payadmin setup` — configure fee, numbers, review channel, optional admin role and DM notification recipient (defaults to the admin running setup)
-- `/payment_panel` — post the player payment panel
+- `/payment_panel [banner:true|false]` — post the player payment panel; the banner is attached when possible and skipped automatically when it cannot be uploaded
 - `/paystatus [record:<PAY-000012 or TrxID>]` — **player command**, no admin rights needed: privately shows your own latest payment (no value) or one specific record you submitted. Every reply is ephemeral and every query is filtered to your own user ID, so nobody can read another player's submission with it; admins keep using `/payadmin lookup`
 - `/payadmin stats` — show total/pending/approved/rejected counts
 - `/payadmin lookup query:<TrxID or PAY-000001>` — look up any submission (admin only)
@@ -84,17 +96,21 @@ Everything can be set with `/payadmin setup`; environment variables are the defa
 | `DATABASE_PATH` | SQLite file, default `data/payments.sqlite3`. |
 | `NOTIFICATION_USER_ID` | Member who receives the review DM. |
 | `REVIEW_CHANNEL_ID`, `REGISTRATION_FEE`, `BKASH_NUMBER`, `NAGAD_NUMBER`, `ROCKET_NUMBER`, `ADMIN_ROLE_ID` | Initial settings values. |
+| `PAYMENT_TITLE` | Headline of the payment panel embed (default `FF Esports Registration`). |
+| `PAYMENT_BANNER_PATH` | Banner file uploaded with the panel, default `assets/payment_banner.png`. Empty disables it; a missing file or refused upload just posts the panel without the image. |
+| `PAYMENT_BANNER_URL` | Optional hosted image URL used instead of uploading the file (no Attach Files needed). |
 
 Never upload `.env` or your token to GitHub.
 
 ## Tests
-The repository ships offline checks that need no token and no Discord connection: schema/migration, button custom IDs, permission rules, embed wording, a full simulated flow (submit → review-channel post → reviewer DM with buttons → approve/reject → player notification), `/paystatus` privacy and the pending-reminder cadence (first reminder at 30 minutes, repeat gated to one per 30 minutes, stopped by a review, blocked-DM handling).
+The repository ships offline checks that need no token and no Discord connection: schema/migration, button custom IDs, permission rules, embed wording, a full simulated flow (submit → review-channel post → reviewer DM with buttons → approve/reject → player notification), `/paystatus` privacy, the pending-reminder cadence (first reminder at 30 minutes, repeat gated to one per 30 minutes, stopped by a review, blocked-DM handling), and the checkout panel (persistent wallet menu, neon embed wording, banner upload with every fallback — no Attach Files, missing file, `banner:False`, hosted URL — plus the registered slash commands).
 
 ```powershell
 pip install pytest
 python tests/test_review_flow.py                    # no test runner required
 python tests/test_end_to_end_flow.py
 python tests/test_payment_status_and_reminders.py
+python tests/test_payment_panel.py
 python -m pytest tests -q
 ```
 
