@@ -29,6 +29,30 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 DB_PATH = os.getenv("DATABASE_PATH", "data/payments.sqlite3")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
+# Optional checkout banner shown at the top of the payment panel embed.
+# PAYMENT_BANNER_PATH is uploaded as a message attachment when the panel is posted
+# (that needs the Attach Files permission); relative paths are resolved against this
+# file's folder so the bot works from any working directory. An empty value disables
+# the banner. PAYMENT_BANNER_URL embeds an already-hosted image instead and needs no
+# upload at all. Neither is required: when the file is missing, unreadable or Discord
+# refuses the upload, the panel is still posted — just without the image.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BANNER_PATH = os.getenv("PAYMENT_BANNER_PATH", "assets/payment_banner.png").strip()
+BANNER_URL = os.getenv("PAYMENT_BANNER_URL", "").strip()
+DEFAULT_PAYMENT_TITLE = "FF Esports Registration"
+
+# Neon esports theme shared by the player-facing checkout embeds and the banner.
+NEON_CYAN = 0x00E5FF
+METHOD_STYLE = {
+    "bKash": {"emoji": "💗", "color": 0xE2136E, "hint": "Send Money to the bKash number"},
+    "Nagad": {"emoji": "🟠", "color": 0xF6921E, "hint": "Send Money to the Nagad number"},
+    "Rocket": {"emoji": "🟣", "color": 0x8C3494, "hint": "Send Money to the Rocket number"},
+}
+
+# Fixed custom ID for the payment panel's wallet menu. Persistent views need a stable
+# custom ID on every component, otherwise the panel stops working after a restart.
+PANEL_SELECT_CUSTOM_ID = "pay:panel:method"
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -161,6 +185,137 @@ def payment_number(method):
 
 def payment_label(payment_id):
     return f"PAY-{int(payment_id):06d}"
+
+
+def payment_title():
+    """Headline used by the checkout panel (PAYMENT_TITLE / settings.payment_title)."""
+    return (setting("payment_title", "") or "").strip() or DEFAULT_PAYMENT_TITLE
+
+
+def configured_methods():
+    """Wallets that have a payment number set, in display order."""
+    return [method for method in METHOD_STYLE if payment_number(method)]
+
+
+def method_badge(method):
+    return f"{METHOD_STYLE[method]['emoji']} {method}"
+
+
+def banner_file_path():
+    """Absolute path of the configured banner file, or '' when the banner is disabled."""
+    if not BANNER_PATH:
+        return ""
+    return BANNER_PATH if os.path.isabs(BANNER_PATH) else os.path.join(BASE_DIR, BANNER_PATH)
+
+
+def banner_attachment():
+    """Open the checkout banner for upload.
+
+    Returns (discord.File, "") when the file is ready, or (None, reason) when there is
+    nothing to upload. A missing or unreadable file is never an error: the panel is
+    simply posted without the image and the admin is told why.
+    """
+    path = banner_file_path()
+    if not path:
+        return None, "PAYMENT_BANNER_PATH is empty"
+    # Discord drops spaces and odd characters from attachment names; the embed's
+    # attachment:// reference must match the final name exactly, so sanitise it here.
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(path)) or "payment_banner.png"
+    try:
+        return discord.File(path, filename=filename), ""
+    except OSError as exc:
+        log.warning("Payment banner %s is not readable (%s); the panel will be posted without it", path, exc)
+        return None, f"banner file not found or unreadable: {BANNER_PATH}"
+
+
+def build_payment_panel_embed(banner_url=None):
+    """Player-facing checkout card — the neon panel design.
+
+    banner_url is either an attachment:// reference (uploaded file), a hosted image
+    URL, or None for the image-free fallback. Everything else is identical, so the
+    panel works the same with or without the banner.
+    """
+    fee = money()
+    embed = discord.Embed(
+        title=f"🎮 {payment_title()}",
+        color=discord.Color(NEON_CYAN),
+        description=(
+            "**Tournament registration checkout**\n"
+            "Lock in your slot in three quick steps:\n\n"
+            "**1️⃣ Choose your wallet** from the menu below\n"
+            f"**2️⃣ Send exactly ৳{fee}** to the number the bot shows you\n"
+            "**3️⃣ Submit your Transaction ID (TrxID)** from the confirmation SMS\n\n"
+            "🔒 **Your registration is not confirmed until an admin manually approves the payment.**"
+        ),
+    )
+    embed.add_field(name="💰 Registration fee", value=f"**৳{fee}**", inline=True)
+    methods = configured_methods()
+    embed.add_field(
+        name="📲 Pay with",
+        value=" • ".join(method_badge(method) for method in methods)
+        if methods else "Not configured yet — ask an admin to run `/payadmin setup`",
+        inline=True,
+    )
+    embed.add_field(name="🔎 Track it", value="`/paystatus` — private, only you can see it", inline=True)
+    embed.add_field(
+        name="✅ After you submit",
+        value=(
+            "You receive a record number like `PAY-000012` and your payment shows as **PENDING**. "
+            "A tournament admin checks the wallet statement by hand and approves or rejects it — "
+            "you are DM'd the result."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ Stay safe",
+        value=(
+            "Send money only to the numbers this bot shows you. Never share your wallet PIN or OTP "
+            "with anyone. Each Transaction ID can be submitted once."
+        ),
+        inline=False,
+    )
+    if banner_url:
+        embed.set_image(url=banner_url)
+    embed.set_footer(text="Manual verification • an admin confirms every bKash / Nagad / Rocket transfer by hand")
+    return embed
+
+
+def build_method_embed(method, number, amount):
+    """Private 'pay via <wallet>' card shown after a player picks a wallet."""
+    style = METHOD_STYLE.get(method, {"emoji": "💳", "color": NEON_CYAN})
+    embed = discord.Embed(
+        title=f"{style['emoji']} Pay via {method}",
+        color=discord.Color(style["color"]),
+        description=(
+            f"Send **৳{amount}** to the {method} number below, then press **Submit Transaction ID** "
+            "and enter the TrxID from your confirmation SMS."
+        ),
+    )
+    embed.add_field(name="Pay to", value=f"`{number}`", inline=True)
+    embed.add_field(name="Amount", value=f"**৳{amount}**", inline=True)
+    embed.add_field(name="Wallet", value=method_badge(method) if method in METHOD_STYLE else method, inline=True)
+    embed.add_field(
+        name="How to pay",
+        value=(
+            f"1. Open {method} and use the transfer type your tournament admin told you to use "
+            "(usually **Send Money**)\n"
+            f"2. Number: `{number}`\n"
+            f"3. Amount: **৳{amount}** — the exact fee\n"
+            "4. Copy the **Transaction ID (TrxID)** from the confirmation SMS\n"
+            "5. Press **Submit Transaction ID** below and fill in the form"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ Keep in mind",
+        value=(
+            "Enter the TrxID exactly as it appears in your wallet SMS and keep it private. "
+            "Payment is not confirmed until an admin manually verifies it in the wallet statement."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Payment is not confirmed until an admin manually verifies it.")
+    return embed
 
 
 def parse_timestamp(value):
@@ -869,41 +1024,98 @@ class PaymentSubmitModal(discord.ui.Modal, title="Submit Payment Details"):
 
         await interaction.response.send_message(
             f"✅ Payment details submitted for **manual verification**.\nRecord: `{payment_label(payment_id)}`\n"
-            "Status: **PENDING**\nAn admin will check the wallet statement and approve or reject it.",
+            "Status: **PENDING**\nAn admin will check the wallet statement and approve or reject it. "
+            "Use `/paystatus` any time to check privately.",
             ephemeral=True,
         )
         await notify_admin_of_submission(channel, embed, payment_id)
 
 
 class MethodSelect(discord.ui.Select):
+    """Wallet picker on the payment panel.
+
+    The custom_id is fixed so the panel is a real persistent view: after a restart
+    on_ready() re-registers it and every panel ever posted keeps working.
+    """
+
     def __init__(self):
-        super().__init__(placeholder="Choose payment method", min_values=1, max_values=1,
-                         options=[
-                             discord.SelectOption(label="bKash", value="bKash", emoji="💗"),
-                             discord.SelectOption(label="Nagad", value="Nagad", emoji="🟠"),
-                             discord.SelectOption(label="Rocket", value="Rocket", emoji="🟣"),
-                         ])
+        super().__init__(
+            custom_id=PANEL_SELECT_CUSTOM_ID,
+            placeholder="Choose your wallet to see the payment number",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=method, value=method, emoji=style["emoji"], description=style["hint"])
+                for method, style in METHOD_STYLE.items()
+            ],
+        )
 
     async def callback(self, interaction: discord.Interaction):
         method = self.values[0]
         number = payment_number(method)
         if not number:
             return await interaction.response.send_message(f"⚠️ {method} is not configured yet. Please contact an admin.", ephemeral=True)
-        embed = discord.Embed(title=f"💳 Pay via {method}", color=discord.Color.blurple(),
-                              description="Send the exact registration fee, then submit your transaction details below.")
-        embed.add_field(name="Pay to", value=f"`{number}`", inline=True)
-        embed.add_field(name="Amount", value=f"**৳{money()}**", inline=True)
-        embed.add_field(name="Payment instruction",
-                        value="Use the payment type specified by the tournament admin. Keep your transaction ID private and enter it accurately.",
-                        inline=False)
-        embed.set_footer(text="Payment is not confirmed until an admin manually verifies it.")
+        embed = build_method_embed(method, number, money())
         await interaction.response.send_message(embed=embed, view=SubmitButtonView(method), ephemeral=True)
 
 
 class PaymentPanelView(discord.ui.View):
+    """Persistent payment panel (timeout=None + fixed custom IDs on every item)."""
+
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(MethodSelect())
+
+
+def describe_banner_failure(exc):
+    """Short, admin-readable reason why the banner upload was refused."""
+    if isinstance(exc, discord.Forbidden):
+        return "the bot is missing the Attach Files permission in this channel"
+    detail = getattr(exc, "text", "") or type(exc).__name__
+    return f"Discord refused the upload: {detail}"
+
+
+async def post_payment_panel(channel, include_banner=True):
+    """Post the checkout panel to *channel*, with the banner when possible.
+
+    The banner is strictly optional. A disabled setting, a missing file or a Discord
+    refusal (typically no Attach Files permission) all fall back to the very same
+    panel without the image, so players can always use it.
+
+    Returns (message, banner_included, detail). message is None when even the plain
+    embed could not be posted; detail then carries the error, otherwise it explains
+    why the banner was left out (empty when it was included).
+    """
+    banner_kwargs, detail = None, ""
+    if not include_banner:
+        detail = "banner disabled for this post"
+    elif BANNER_URL:
+        banner_kwargs = {"embed": build_payment_panel_embed(banner_url=BANNER_URL)}
+    else:
+        file, reason = banner_attachment()
+        if file is None:
+            detail = reason
+        else:
+            banner_kwargs = {
+                "embed": build_payment_panel_embed(banner_url=f"attachment://{file.filename}"),
+                "file": file,
+            }
+
+    if banner_kwargs is not None:
+        try:
+            message = await channel.send(view=PaymentPanelView(), **banner_kwargs)
+            return message, True, ""
+        except discord.HTTPException as exc:
+            # discord.py closes the file after the attempt; the retry below does not need it.
+            log.warning("Posting the payment panel with the banner failed (%s); retrying without it", exc)
+            detail = describe_banner_failure(exc)
+
+    try:
+        message = await channel.send(embed=build_payment_panel_embed(), view=PaymentPanelView())
+    except discord.HTTPException as exc:
+        log.warning("Could not post the payment panel: %s", exc)
+        return None, False, f"{type(exc).__name__}: {getattr(exc, 'text', '') or exc}"
+    return message, False, detail
 
 
 class SubmitButtonView(discord.ui.View):
@@ -916,16 +1128,29 @@ class SubmitButtonView(discord.ui.View):
         await interaction.response.send_modal(PaymentSubmitModal(self.method))
 
 
+def register_persistent_views():
+    """Re-attach the payment panel and every pending Approve/Reject pair after a restart.
+
+    Returns the number of views registered. Safe to call without a gateway
+    connection, which is how the offline tests exercise it.
+    """
+    bot.add_view(PaymentPanelView())
+    with db() as conn:
+        rows = conn.execute("SELECT id FROM payments WHERE status='PENDING'").fetchall()
+    for row in rows:
+        bot.add_view(ReviewView(row["id"]))
+    log.info("Registered persistent views: payment panel + %d pending review(s)", len(rows))
+    return 1 + len(rows)
+
+
 @bot.event
 async def on_ready():
     init_db()
     if not getattr(bot, "_persistent_views_added", False):
-        bot.add_view(PaymentPanelView())
-        # Re-register Approve/Reject for every pending payment so buttons survive restarts.
-        with db() as conn:
-            rows = conn.execute("SELECT id FROM payments WHERE status='PENDING'").fetchall()
-        for row in rows:
-            bot.add_view(ReviewView(row["id"]))
+        try:
+            register_persistent_views()
+        except Exception:  # never let a view problem block command sync or reminders
+            log.exception("Registering persistent views failed")
         bot._persistent_views_added = True
     if not getattr(bot, "_reminder_sweep_started", False):
         pending_reminder_task.start()
@@ -943,14 +1168,28 @@ async def on_ready():
 
 
 @bot.tree.command(name="payment_panel", description="Post the payment submission panel")
-async def payment_panel(interaction: discord.Interaction):
+@app_commands.describe(banner="Include the checkout banner image (default: yes; skipped automatically if it cannot be uploaded)")
+async def payment_panel(interaction: discord.Interaction, banner: bool = True):
     if not is_admin(interaction):
         return await interaction.response.send_message("⛔ Admin only.", ephemeral=True)
-    embed = discord.Embed(title="💳 Tournament Registration Payment", color=discord.Color.blurple(),
-                          description="Choose your payment method, pay the displayed fee, and submit your Transaction ID.\n\n**Your registration is not confirmed until an admin approves the payment.**")
-    embed.add_field(name="Supported methods", value="bKash • Nagad • Rocket", inline=False)
-    await interaction.channel.send(embed=embed, view=PaymentPanelView())
-    await interaction.response.send_message("✅ Payment panel posted.", ephemeral=True)
+    if interaction.channel is None:
+        return await interaction.response.send_message("Use this command inside a server text channel.", ephemeral=True)
+    # Uploading the banner can take a moment; acknowledge now so the interaction cannot expire.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    message, banner_included, detail = await post_payment_panel(interaction.channel, include_banner=banner)
+    if message is None:
+        return await interaction.followup.send(
+            f"❌ Couldn't post the payment panel ({detail}). Check that the bot has View Channel, "
+            "Send Messages and Embed Links here.",
+            ephemeral=True,
+        )
+    if banner_included:
+        return await interaction.followup.send("✅ Payment panel posted with the checkout banner.", ephemeral=True)
+    await interaction.followup.send(
+        f"✅ Payment panel posted without the banner ({detail}). Players can use it normally; "
+        "grant Attach Files or fix `PAYMENT_BANNER_PATH` and re-post to include the image.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="paystatus", description="Privately check your own payment status")
